@@ -352,6 +352,14 @@ impl Cache {
 
     /// Loads all core caches (currencies, instruments, accounts, orders, positions) from the database.
     ///
+    /// Currencies, instruments, and synthetics are **merged** into any definitions already held
+    /// in memory (database values overwrite on matching keys). This supports live workflows where
+    /// catalog data arrives from a data client before a backing-store reload: a store that omits
+    /// catalog rows (for example a filtered adapter) must not erase in-memory definitions still
+    /// required for positions and portfolio updates.
+    ///
+    /// Accounts, orders, and positions are **replaced** from the database snapshot.
+    ///
     /// # Errors
     ///
     /// Returns an error if loading all cache data fails.
@@ -361,9 +369,15 @@ impl Cache {
             None => CacheMap::default(),
         };
 
-        self.currencies = cache_map.currencies;
-        self.instruments = cache_map.instruments;
-        self.synthetics = cache_map.synthetics;
+        for (id, currency) in cache_map.currencies {
+            self.currencies.insert(id, currency);
+        }
+        for (id, instrument) in cache_map.instruments {
+            self.instruments.insert(id, instrument);
+        }
+        for (id, synthetic) in cache_map.synthetics {
+            self.synthetics.insert(id, synthetic);
+        }
         self.accounts = cache_map
             .accounts
             .into_iter()
@@ -691,6 +705,12 @@ impl Cache {
     #[must_use]
     pub const fn has_backing(&self) -> bool {
         self.database.is_some()
+    }
+
+    /// Returns whether the backing database is flushed on node start.
+    #[must_use]
+    pub const fn flush_on_start(&self) -> bool {
+        self.config.flush_on_start
     }
 
     // Calculate the unrealized profit and loss (PnL) for `position`.

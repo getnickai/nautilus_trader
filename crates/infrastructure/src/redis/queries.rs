@@ -13,17 +13,18 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use ahash::AHashMap;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::future::join_all;
+use futures::stream::{self, StreamExt};
 use nautilus_common::{cache::database::CacheMap, enums::SerializationEncoding};
 use nautilus_model::{
     accounts::AccountAny,
     data::{CustomData, DataType, HasTsInit},
-    identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId},
+    events::{AccountState, OrderEventAny},
+    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, PositionId},
     instruments::{InstrumentAny, SyntheticInstrument},
     orders::OrderAny,
     position::Position,
@@ -66,7 +67,28 @@ const INDEX_POSITIONS_CLOSED: &str = "index:positions_closed";
 #[derive(Debug)]
 pub struct DatabaseQueries;
 
+/// Max concurrent per-key Redis reads when hydrating collections (orders, instruments, etc.).
+/// Unbounded concurrent loads can overload a single Redis connection and hit `response_timeout`.
+const REDIS_KEY_LOAD_CONCURRENCY: usize = 64;
+
 impl DatabaseQueries {
+    /// Strips `{trader_key}:{collection}:` from a full Redis key returned by [`Self::scan_keys`].
+    ///
+    /// The remainder is the record identifier. Identifiers may contain `:` (for example
+    /// [`InstrumentId`] and [`PositionId`]); they must not be parsed with [`str::rsplit`].
+    fn record_id_from_scanned_key<'a>(
+        full_key: &'a str,
+        trader_key: &str,
+        collection: &str,
+    ) -> Option<&'a str> {
+        let mut prefix = String::with_capacity(trader_key.len() + collection.len() + 3);
+        prefix.push_str(trader_key);
+        prefix.push(REDIS_DELIMITER);
+        prefix.push_str(collection);
+        prefix.push(REDIS_DELIMITER);
+        full_key.strip_prefix(&prefix)
+    }
+
     /// Serializes the given `payload` using the specified `encoding` to a byte vector.
     ///
     /// # Errors
@@ -300,12 +322,12 @@ impl DatabaseQueries {
 
         // Process the bulk results
         for (key, value_opt) in keys.iter().zip(bulk_values.iter()) {
-            let currency_code = if let Some(code) = key.as_str().rsplit(':').next() {
-                Ustr::from(code)
-            } else {
+            let Some(code) = Self::record_id_from_scanned_key(key.as_str(), trader_key, CURRENCIES)
+            else {
                 log::error!("Invalid key format: {key}");
                 continue;
             };
+            let currency_code = Ustr::from(code);
 
             if let Some(value_bytes) = value_opt {
                 match Self::deserialize_payload(encoding, value_bytes) {
@@ -348,48 +370,42 @@ impl DatabaseQueries {
         let mut con = con.clone();
         let keys = Self::scan_keys(&mut con, pattern).await?;
 
-        let futures: Vec<_> = keys
-            .iter()
-            .map(|key| {
-                let con = con.clone();
-                async move {
-                    let instrument_id = key
-                        .as_str()
-                        .rsplit(':')
-                        .next()
-                        .ok_or_else(|| {
-                            log::error!("Invalid key format: {key}");
-                            "Invalid key format"
-                        })
-                        .and_then(|code| {
-                            InstrumentId::from_str(code).map_err(|e| {
-                                log::error!("Failed to convert to InstrumentId for {key}: {e}");
-                                "Invalid instrument ID"
-                            })
-                        });
+        let tk = Arc::<str>::from(trader_key);
+        let rows: Vec<_> = stream::iter(keys.into_iter().map(|key| {
+            let con = con.clone();
+            let tk = Arc::clone(&tk);
+            async move {
+                let Some(code) = Self::record_id_from_scanned_key(key.as_str(), tk.as_ref(), INSTRUMENTS)
+                else {
+                    log::error!("Invalid key format: {key}");
+                    return None;
+                };
+                let instrument_id = match InstrumentId::from_str(code) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        log::error!("Failed to convert to InstrumentId for {key}: {e}");
+                        return None;
+                    }
+                };
 
-                    let instrument_id = match instrument_id {
-                        Ok(id) => id,
-                        Err(_) => return None,
-                    };
-
-                    match Self::load_instrument(&con, trader_key, &instrument_id, encoding).await {
-                        Ok(Some(instrument)) => Some((instrument_id, instrument)),
-                        Ok(None) => {
-                            log::error!("Instrument not found: {instrument_id}");
-                            None
-                        }
-                        Err(e) => {
-                            log::error!("Failed to load instrument {instrument_id}: {e}");
-                            None
-                        }
+                match Self::load_instrument(&con, tk.as_ref(), &instrument_id, encoding).await {
+                    Ok(Some(instrument)) => Some((instrument_id, instrument)),
+                    Ok(None) => {
+                        log::error!("Instrument not found: {instrument_id}");
+                        None
+                    }
+                    Err(e) => {
+                        log::error!("Failed to load instrument {instrument_id}: {e}");
+                        None
                     }
                 }
-            })
-            .collect();
+            }
+        }))
+        .buffer_unordered(REDIS_KEY_LOAD_CONCURRENCY)
+        .collect()
+        .await;
 
-        // Insert all Instrument_id (key) and Instrument (value) into the HashMap, filtering out None values.
-        instruments.extend(join_all(futures).await.into_iter().flatten());
+        instruments.extend(rows.into_iter().flatten());
         log::debug!("Loaded {} instruments(s)", instruments.len());
 
         Ok(instruments)
@@ -417,48 +433,42 @@ impl DatabaseQueries {
         let mut con = con.clone();
         let keys = Self::scan_keys(&mut con, pattern).await?;
 
-        let futures: Vec<_> = keys
-            .iter()
-            .map(|key| {
-                let con = con.clone();
-                async move {
-                    let instrument_id = key
-                        .as_str()
-                        .rsplit(':')
-                        .next()
-                        .ok_or_else(|| {
-                            log::error!("Invalid key format: {key}");
-                            "Invalid key format"
-                        })
-                        .and_then(|code| {
-                            InstrumentId::from_str(code).map_err(|e| {
-                                log::error!("Failed to parse InstrumentId for {key}: {e}");
-                                "Invalid instrument ID"
-                            })
-                        });
+        let tk = Arc::<str>::from(trader_key);
+        let rows: Vec<_> = stream::iter(keys.into_iter().map(|key| {
+            let con = con.clone();
+            let tk = Arc::clone(&tk);
+            async move {
+                let Some(code) = Self::record_id_from_scanned_key(key.as_str(), tk.as_ref(), SYNTHETICS)
+                else {
+                    log::error!("Invalid key format: {key}");
+                    return None;
+                };
+                let instrument_id = match InstrumentId::from_str(code) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        log::error!("Failed to parse InstrumentId for {key}: {e}");
+                        return None;
+                    }
+                };
 
-                    let instrument_id = match instrument_id {
-                        Ok(id) => id,
-                        Err(_) => return None,
-                    };
-
-                    match Self::load_synthetic(&con, trader_key, &instrument_id, encoding).await {
-                        Ok(Some(synthetic)) => Some((instrument_id, synthetic)),
-                        Ok(None) => {
-                            log::error!("Synthetic not found: {instrument_id}");
-                            None
-                        }
-                        Err(e) => {
-                            log::error!("Failed to load synthetic {instrument_id}: {e}");
-                            None
-                        }
+                match Self::load_synthetic(&con, tk.as_ref(), &instrument_id, encoding).await {
+                    Ok(Some(synthetic)) => Some((instrument_id, synthetic)),
+                    Ok(None) => {
+                        log::error!("Synthetic not found: {instrument_id}");
+                        None
+                    }
+                    Err(e) => {
+                        log::error!("Failed to load synthetic {instrument_id}: {e}");
+                        None
                     }
                 }
-            })
-            .collect();
+            }
+        }))
+        .buffer_unordered(REDIS_KEY_LOAD_CONCURRENCY)
+        .collect()
+        .await;
 
-        // Insert all Instrument_id (key) and Synthetic (value) into the HashMap, filtering out None values.
-        synthetics.extend(join_all(futures).await.into_iter().flatten());
+        synthetics.extend(rows.into_iter().flatten());
         log::debug!("Loaded {} synthetics(s)", synthetics.len());
 
         Ok(synthetics)
@@ -486,35 +496,36 @@ impl DatabaseQueries {
         let mut con = con.clone();
         let keys = Self::scan_keys(&mut con, pattern).await?;
 
-        let futures: Vec<_> = keys
-            .iter()
-            .map(|key| {
-                let con = con.clone();
-                async move {
-                    let account_id = if let Some(code) = key.as_str().rsplit(':').next() {
-                        AccountId::from(code)
-                    } else {
-                        log::error!("Invalid key format: {key}");
-                        return None;
-                    };
+        let tk = Arc::<str>::from(trader_key);
+        let rows: Vec<_> = stream::iter(keys.into_iter().map(|key| {
+            let con = con.clone();
+            let tk = Arc::clone(&tk);
+            async move {
+                let Some(code) = Self::record_id_from_scanned_key(key.as_str(), tk.as_ref(), ACCOUNTS)
+                else {
+                    log::error!("Invalid key format: {key}");
+                    return None;
+                };
+                let account_id = AccountId::from(code);
 
-                    match Self::load_account(&con, trader_key, &account_id, encoding).await {
-                        Ok(Some(account)) => Some((account_id, account)),
-                        Ok(None) => {
-                            log::error!("Account not found: {account_id}");
-                            None
-                        }
-                        Err(e) => {
-                            log::error!("Failed to load account {account_id}: {e}");
-                            None
-                        }
+                match Self::load_account(&con, tk.as_ref(), &account_id, encoding).await {
+                    Ok(Some(account)) => Some((account_id, account)),
+                    Ok(None) => {
+                        log::error!("Account not found: {account_id}");
+                        None
+                    }
+                    Err(e) => {
+                        log::error!("Failed to load account {account_id}: {e}");
+                        None
                     }
                 }
-            })
-            .collect();
+            }
+        }))
+        .buffer_unordered(REDIS_KEY_LOAD_CONCURRENCY)
+        .collect()
+        .await;
 
-        // Insert all Account_id (key) and Account (value) into the HashMap, filtering out None values.
-        accounts.extend(join_all(futures).await.into_iter().flatten());
+        accounts.extend(rows.into_iter().flatten());
         log::debug!("Loaded {} accounts(s)", accounts.len());
 
         Ok(accounts)
@@ -542,35 +553,36 @@ impl DatabaseQueries {
         let mut con = con.clone();
         let keys = Self::scan_keys(&mut con, pattern).await?;
 
-        let futures: Vec<_> = keys
-            .iter()
-            .map(|key| {
-                let con = con.clone();
-                async move {
-                    let client_order_id = if let Some(code) = key.as_str().rsplit(':').next() {
-                        ClientOrderId::from(code)
-                    } else {
-                        log::error!("Invalid key format: {key}");
-                        return None;
-                    };
+        let tk = Arc::<str>::from(trader_key);
+        let rows: Vec<_> = stream::iter(keys.into_iter().map(|key| {
+            let con = con.clone();
+            let tk = Arc::clone(&tk);
+            async move {
+                let Some(code) = Self::record_id_from_scanned_key(key.as_str(), tk.as_ref(), ORDERS)
+                else {
+                    log::error!("Invalid key format: {key}");
+                    return None;
+                };
+                let client_order_id = ClientOrderId::from(code);
 
-                    match Self::load_order(&con, trader_key, &client_order_id, encoding).await {
-                        Ok(Some(order)) => Some((client_order_id, order)),
-                        Ok(None) => {
-                            log::error!("Order not found: {client_order_id}");
-                            None
-                        }
-                        Err(e) => {
-                            log::error!("Failed to load order {client_order_id}: {e}");
-                            None
-                        }
+                match Self::load_order(&con, tk.as_ref(), &client_order_id, encoding).await {
+                    Ok(Some(order)) => Some((client_order_id, order)),
+                    Ok(None) => {
+                        log::error!("Order not found: {client_order_id}");
+                        None
+                    }
+                    Err(e) => {
+                        log::error!("Failed to load order {client_order_id}: {e}");
+                        None
                     }
                 }
-            })
-            .collect();
+            }
+        }))
+        .buffer_unordered(REDIS_KEY_LOAD_CONCURRENCY)
+        .collect()
+        .await;
 
-        // Insert all Client-Order-Id (key) and Order (value) into the HashMap, filtering out None values.
-        orders.extend(join_all(futures).await.into_iter().flatten());
+        orders.extend(rows.into_iter().flatten());
         log::debug!("Loaded {} order(s)", orders.len());
 
         Ok(orders)
@@ -598,35 +610,36 @@ impl DatabaseQueries {
         let mut con = con.clone();
         let keys = Self::scan_keys(&mut con, pattern).await?;
 
-        let futures: Vec<_> = keys
-            .iter()
-            .map(|key| {
-                let con = con.clone();
-                async move {
-                    let position_id = if let Some(code) = key.as_str().rsplit(':').next() {
-                        PositionId::from(code)
-                    } else {
-                        log::error!("Invalid key format: {key}");
-                        return None;
-                    };
+        let tk = Arc::<str>::from(trader_key);
+        let rows: Vec<_> = stream::iter(keys.into_iter().map(|key| {
+            let con = con.clone();
+            let tk = Arc::clone(&tk);
+            async move {
+                let Some(code) = Self::record_id_from_scanned_key(key.as_str(), tk.as_ref(), POSITIONS)
+                else {
+                    log::error!("Invalid key format: {key}");
+                    return None;
+                };
+                let position_id = PositionId::from(code);
 
-                    match Self::load_position(&con, trader_key, &position_id, encoding).await {
-                        Ok(Some(position)) => Some((position_id, position)),
-                        Ok(None) => {
-                            log::error!("Position not found: {position_id}");
-                            None
-                        }
-                        Err(e) => {
-                            log::error!("Failed to load position {position_id}: {e}");
-                            None
-                        }
+                match Self::load_position(&con, tk.as_ref(), &position_id, encoding).await {
+                    Ok(Some(position)) => Some((position_id, position)),
+                    Ok(None) => {
+                        log::error!("Position not found: {position_id}");
+                        None
+                    }
+                    Err(e) => {
+                        log::error!("Failed to load position {position_id}: {e}");
+                        None
                     }
                 }
-            })
-            .collect();
+            }
+        }))
+        .buffer_unordered(REDIS_KEY_LOAD_CONCURRENCY)
+        .collect()
+        .await;
 
-        // Insert all Position_id (key) and Position (value) into the HashMap, filtering out None values.
-        positions.extend(join_all(futures).await.into_iter().flatten());
+        positions.extend(rows.into_iter().flatten());
         log::debug!("Loaded {} position(s)", positions.len());
 
         Ok(positions)
@@ -779,7 +792,11 @@ impl DatabaseQueries {
             return Ok(None);
         }
 
-        let account: AccountAny = Self::deserialize_payload(encoding, &result[0])?;
+        let events: Vec<AccountState> = result
+            .iter()
+            .map(|bytes| Self::deserialize_payload(encoding, bytes))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let account = AccountAny::from_events(&events)?;
         Ok(Some(account))
     }
 
@@ -800,7 +817,11 @@ impl DatabaseQueries {
             return Ok(None);
         }
 
-        let order: OrderAny = Self::deserialize_payload(encoding, &result[0])?;
+        let events: Vec<OrderEventAny> = result
+            .iter()
+            .map(|bytes| Self::deserialize_payload(encoding, bytes))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let order = OrderAny::from_events(events)?;
         Ok(Some(order))
     }
 
@@ -821,8 +842,104 @@ impl DatabaseQueries {
             return Ok(None);
         }
 
-        let position: Position = Self::deserialize_payload(encoding, &result[0])?;
+        // Each update appends a full serialized position snapshot; the last entry is canonical.
+        let bytes = &result[result.len() - 1];
+        let position: Position = Self::deserialize_payload(encoding, bytes)?;
         Ok(Some(position))
+    }
+
+    /// Loads all `general:*` rows for `trader_key` as a map of relative keys to raw payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if scanning keys or bulk reads fail.
+    pub async fn load_general_kv(
+        con: &ConnectionManager,
+        trader_key: &str,
+    ) -> anyhow::Result<AHashMap<String, Bytes>> {
+        let mut con = con.clone();
+        let pattern = format!("{trader_key}{REDIS_DELIMITER}{GENERAL}*");
+        let keys = Self::scan_keys(&mut con, pattern).await?;
+        if keys.is_empty() {
+            return Ok(AHashMap::new());
+        }
+
+        let values = Self::read_bulk(&con, &keys).await?;
+        let prefix = format!("{trader_key}{REDIS_DELIMITER}");
+        let mut out = AHashMap::with_capacity(keys.len());
+        for (key, value_opt) in keys.iter().zip(values.iter()) {
+            let Some(value) = value_opt else {
+                continue;
+            };
+            let short_key = key
+                .strip_prefix(&prefix)
+                .unwrap_or(key.as_str())
+                .to_string();
+            out.insert(short_key, value.clone());
+        }
+        Ok(out)
+    }
+
+    /// Reads the persisted `index:order_client` hash as typed identifiers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Redis `HGETALL` fails or identifier parsing is invalid.
+    pub async fn load_index_order_client_hash(
+        con: &ConnectionManager,
+        trader_key: &str,
+    ) -> anyhow::Result<AHashMap<ClientOrderId, ClientId>> {
+        let mut con = con.clone();
+        let full_key = format!("{trader_key}{REDIS_DELIMITER}{INDEX_ORDER_CLIENT}");
+        let raw: HashMap<String, String> = con.hgetall(&full_key).await?;
+        let mut out = AHashMap::with_capacity(raw.len());
+        for (k, v) in raw {
+            out.insert(ClientOrderId::from(k.as_str()), ClientId::new(v.as_str()));
+        }
+        Ok(out)
+    }
+
+    /// Resolves `index:order_position` into fully hydrated [`Position`] values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index read, any position load, or deserialization fails.
+    pub async fn load_index_order_position_resolved(
+        con: &ConnectionManager,
+        trader_key: &str,
+        encoding: SerializationEncoding,
+    ) -> anyhow::Result<AHashMap<ClientOrderId, Position>> {
+        let mut con_h = con.clone();
+        let full_key = format!("{trader_key}{REDIS_DELIMITER}{INDEX_ORDER_POSITION}");
+        let raw: HashMap<String, String> = con_h.hgetall(&full_key).await?;
+        let mut out = AHashMap::with_capacity(raw.len());
+        let tk = Arc::<str>::from(trader_key);
+        let rows: Vec<_> = stream::iter(
+            raw.into_iter().map(|(coid_str, pid_str)| {
+                (
+                    ClientOrderId::from(coid_str.as_str()),
+                    PositionId::new(pid_str),
+                )
+            }),
+        )
+        .map(|(coid, pid)| {
+            let con = con.clone();
+            let tk = Arc::clone(&tk);
+            async move {
+                match Self::load_position(&con, tk.as_ref(), &pid, encoding).await {
+                    Ok(Some(position)) => Some((coid, position)),
+                    Ok(None) | Err(_) => None,
+                }
+            }
+        })
+        .buffer_unordered(REDIS_KEY_LOAD_CONCURRENCY)
+        .collect()
+        .await;
+
+        for pair in rows.into_iter().flatten() {
+            out.insert(pair.0, pair.1);
+        }
+        Ok(out)
     }
 
     fn get_collection_key(key: &str) -> anyhow::Result<&str> {

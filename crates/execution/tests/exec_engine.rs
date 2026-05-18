@@ -10884,11 +10884,12 @@ fn test_load_cache_no_reentrant_panic(#[case] manage_own_order_books: bool) {
 
     poll_to_completion(engine.load_cache()).expect("load_cache should not panic");
 
-    // With `database: None`, `cache_all` replaces all orders/positions with empty
-    // maps, so the staged order is wiped and the own-book loop has nothing to
-    // process. Verify the full flow ran end-to-end (the original bug
-    // short-circuited before `cache_all` could clear) and the optional own-book
-    // branch did not produce a book for this instrument.
+    // With `database: None`, `cache_all` replaces orders/positions with empty maps,
+    // so the staged order is wiped and the own-book loop has nothing to process.
+    // Catalog maps merge from an empty snapshot, so the instrument may remain.
+    // Verify the full flow ran end-to-end (the original bug short-circuited before
+    // `cache_all` could run) and the optional own-book branch did not produce a book
+    // for this instrument.
     let cache = engine.cache().borrow();
     assert!(cache.orders(None, None, None, None, None).is_empty());
     assert!(cache.own_order_book(&instrument.id).is_none());

@@ -36,6 +36,9 @@
 //! 2. Flush all pending data events and commands into the cache via
 //!    `flush_pending_data`, which loops `try_recv` on the channel receivers
 //!    until no items remain.
+//! 2b. If configured, reload orders and positions from the cache backing store
+//!    (`exec_engine.load_cache`) so deserialization sees instruments and
+//!    currencies already in memory.
 //! 3. Connect execution clients (`load_instruments_from_cache` now finds
 //!    populated instruments).
 //! 4. Drain remaining events, then run reconciliation.
@@ -371,6 +374,8 @@ impl LiveNode {
             runner.flush_pending_data();
         }
 
+        self.hydrate_exec_cache_from_backing().await;
+
         self.kernel.connect_exec_clients().await;
 
         if !self.await_engines_connected().await {
@@ -509,6 +514,30 @@ impl LiveNode {
             self.kernel.data_engine().check_connected(),
             self.kernel.exec_engine().borrow().check_connected(),
         );
+    }
+
+    /// Loads orders and positions from the cache backing store after catalog data
+    /// is present in memory.
+    ///
+    /// Must run after data clients have delivered instrument and currency definitions;
+    /// otherwise deserialization can fail for non-standard symbols (for example
+    /// `0G` as a base currency code).
+    #[expect(clippy::await_holding_refcell_ref)] // Single-threaded runtime, intentional design
+    async fn hydrate_exec_cache_from_backing(&mut self) {
+        let should_load = {
+            let cache_rc = self.kernel.cache();
+            let cache = cache_rc.borrow();
+            self.config.exec_engine.load_cache
+                && cache.has_backing()
+                && !cache.flush_on_start()
+        };
+        if !should_load {
+            return;
+        }
+
+        if let Err(e) = self.kernel.exec_engine.borrow_mut().load_cache().await {
+            log::error!("Failed to load execution cache from backing store: {e}");
+        }
     }
 
     /// Performs startup reconciliation to align internal state with venue state.
@@ -702,6 +731,8 @@ impl LiveNode {
             pending.data_evts.is_empty() && pending.data_cmds.is_empty(),
             "data must be drained into cache before exec clients connect",
         );
+
+        self.hydrate_exec_cache_from_backing().await;
 
         // Startup phase 2: Connect execution clients (instruments now in cache)
         let engines_connected = drive_with_event_buffering(

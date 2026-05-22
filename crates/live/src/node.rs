@@ -401,6 +401,13 @@ impl LiveNode {
     /// # Errors
     ///
     /// Returns an error if shutdown fails.
+    /// Disposes the node by flushing the cache database adapter (including the Redis writer task).
+    ///
+    /// Call this once after `run()` returns to ensure all pending writes are flushed before exit.
+    pub fn dispose(&mut self) {
+        self.kernel.dispose();
+    }
+
     pub async fn stop(&mut self) -> anyhow::Result<()> {
         if !self.state().is_running() {
             anyhow::bail!("Not running");

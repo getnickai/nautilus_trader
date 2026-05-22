@@ -78,6 +78,7 @@ mod serial_tests {
         let adapter = RedisCacheDatabaseAdapter {
             encoding: SerializationEncoding::MsgPack,
             database,
+            save_market_data: true,
         };
 
         Ok(adapter)

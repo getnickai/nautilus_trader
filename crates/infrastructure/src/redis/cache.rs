@@ -1033,6 +1033,9 @@ fn get_collection_key(key: &str) -> anyhow::Result<&str> {
 pub struct RedisCacheDatabaseAdapter {
     pub encoding: SerializationEncoding,
     pub database: RedisCacheDatabase,
+    /// If false, `add_instrument`, `add_currency`, and `add_synthetic` are no-ops.
+    /// Defaults to `true` for backward compatibility.
+    pub save_market_data: bool,
 }
 
 impl RedisCacheDatabaseAdapter {
@@ -1071,6 +1074,10 @@ impl RedisCacheDatabaseAdapter {
 
     /// Replays all persisted order events on the read connection, appends `order_event`, and
     /// materializes the resulting [`OrderAny`] for index maintenance (mirrors Python semantics).
+    ///
+    /// This function is retained for potential use outside the hot path but is no longer
+    /// called from `update_order` (replaced by event-driven `update_order_indexes_from_event`).
+    #[allow(dead_code)]
     fn materialize_order_after_append(
         &self,
         order_event: &OrderEventAny,
@@ -1140,6 +1147,55 @@ impl RedisCacheDatabaseAdapter {
             )?;
         }
 
+        Ok(())
+    }
+
+    /// Updates order index sets based on a single [`OrderEventAny`] without
+    /// materializing the full order from Redis. All writes are fire-and-forget.
+    ///
+    /// Note: [`Bytes`] is moved into each queued Redis command; clone() calls are
+    /// intentional so the client-order-id payload can be reused across multiple index writes.
+    #[allow(clippy::redundant_clone)]
+    fn update_order_indexes_from_event(&self, event: &OrderEventAny) -> anyhow::Result<()> {
+        let member = Bytes::from(event.client_order_id().to_string());
+        match event {
+            OrderEventAny::Submitted(_)
+            | OrderEventAny::PendingCancel(_)
+            | OrderEventAny::PendingUpdate(_) => {
+                self.send_index_set_member(INDEX_ORDERS_INFLIGHT, member)?;
+            }
+            OrderEventAny::Accepted(e) => {
+                let _ = e; // venue_order_id available but INDEX_ORDER_IDS tracks client_order_id as a set
+                self.send_index_set_delete(INDEX_ORDERS_INFLIGHT, member.clone())?;
+                self.send_index_set_member(INDEX_ORDERS_OPEN, member.clone())?;
+                // Record that this order now has a venue order ID assigned.
+                self.send_index_set_member(INDEX_ORDER_IDS, member)?;
+            }
+            OrderEventAny::Triggered(_) => {
+                self.send_index_set_delete(INDEX_ORDERS_INFLIGHT, member.clone())?;
+                self.send_index_set_member(INDEX_ORDERS_OPEN, member)?;
+            }
+            OrderEventAny::Rejected(_)
+            | OrderEventAny::Denied(_)
+            | OrderEventAny::Expired(_)
+            | OrderEventAny::Canceled(_) => {
+                self.send_index_set_delete(INDEX_ORDERS_INFLIGHT, member.clone())?;
+                self.send_index_set_delete(INDEX_ORDERS_OPEN, member.clone())?;
+                self.send_index_set_member(INDEX_ORDERS_CLOSED, member)?;
+            }
+            OrderEventAny::Filled(_) => {
+                // On any fill event move to closed; partial fills that remain open
+                // will be corrected by the in-memory cache state which is the ground truth.
+                self.send_index_set_delete(INDEX_ORDERS_INFLIGHT, member.clone())?;
+                self.send_index_set_delete(INDEX_ORDERS_OPEN, member.clone())?;
+                self.send_index_set_member(INDEX_ORDERS_CLOSED, member)?;
+            }
+            OrderEventAny::ModifyRejected(_) | OrderEventAny::CancelRejected(_) => {
+                self.send_index_set_delete(INDEX_ORDERS_INFLIGHT, member.clone())?;
+                self.send_index_set_member(INDEX_ORDERS_OPEN, member)?;
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -1467,18 +1523,27 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
     }
 
     fn add_currency(&self, currency: &Currency) -> anyhow::Result<()> {
+        if !self.save_market_data {
+            return Ok(());
+        }
         let bytes = self.serialize_value(currency)?;
         let key = format!("{CURRENCIES}{REDIS_DELIMITER}{}", currency.code);
         self.send_insert(key, Some(vec![Bytes::from(bytes)]))
     }
 
     fn add_instrument(&self, instrument: &InstrumentAny) -> anyhow::Result<()> {
+        if !self.save_market_data {
+            return Ok(());
+        }
         let bytes = self.serialize_value(instrument)?;
         let key = format!("{INSTRUMENTS}{REDIS_DELIMITER}{}", instrument.id());
         self.send_insert(key, Some(vec![Bytes::from(bytes)]))
     }
 
     fn add_synthetic(&self, synthetic: &SyntheticInstrument) -> anyhow::Result<()> {
+        if !self.save_market_data {
+            return Ok(());
+        }
         let bytes = self.serialize_value(synthetic)?;
         let key = format!("{SYNTHETICS}{REDIS_DELIMITER}{}", synthetic.id);
         self.send_insert(key, Some(vec![Bytes::from(bytes)]))
@@ -1513,7 +1578,6 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
                 Bytes::from(cid_str),
             )?;
         }
-        self.database.await_writer_commit()?;
         Ok(())
     }
 
@@ -1719,13 +1783,10 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
     }
 
     fn update_order(&self, order_event: &OrderEventAny) -> anyhow::Result<()> {
-        let order = self.materialize_order_after_append(order_event)?;
         let bytes = Bytes::from(self.serialize_value(order_event)?);
-        let key = format!("{ORDERS}{REDIS_DELIMITER}{}", order.client_order_id());
+        let key = format!("{ORDERS}{REDIS_DELIMITER}{}", order_event.client_order_id());
         self.send_update(key, Some(vec![bytes]))?;
-        self.sync_order_indexes_from_state(&order)?;
-        self.database.await_writer_commit()?;
-        Ok(())
+        self.update_order_indexes_from_event(order_event)
     }
 
     fn update_position(&self, position: &Position) -> anyhow::Result<()> {

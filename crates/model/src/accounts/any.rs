@@ -207,10 +207,13 @@ impl AccountAny {
     ///
     /// Returns an error if the account type is `Wallet` (unsupported in Rust).
     pub fn try_from_state(event: AccountState) -> Result<Self, &'static str> {
+        // calculate_account_state = true: the portfolio manager computes balance changes
+        // from order/position events. Required for sandbox accounts which do not emit
+        // AccountState events on every fill or cancel.
         match event.account_type {
-            AccountType::Margin => Ok(Self::Margin(MarginAccount::new(event, false))),
-            AccountType::Cash => Ok(Self::Cash(CashAccount::new(event, false, false))),
-            AccountType::Betting => Ok(Self::Betting(BettingAccount::new(event, false))),
+            AccountType::Margin => Ok(Self::Margin(MarginAccount::new(event, true))),
+            AccountType::Cash => Ok(Self::Cash(CashAccount::new(event, true, false))),
+            AccountType::Betting => Ok(Self::Betting(BettingAccount::new(event, true))),
             AccountType::Wallet => Err("Wallet accounts are not yet implemented in Rust"),
         }
     }

@@ -2260,11 +2260,15 @@ fn update_order(
     };
 
     if let OrderEventAny::Filled(order_filled) = event {
-        let (post_balance, _state) =
+        let (mut post_balance, fill_state) =
             inner
                 .borrow()
                 .accounts
                 .update_balances(working_account, &instrument, *order_filled);
+        // Apply fill_state so last_event() returns the post-fill balance.
+        // Without this, database.update_account() writes the stale seed AccountState
+        // to Redis and hydration after eviction restores the initial balance.
+        let _ = post_balance.apply(fill_state);
         working_account = post_balance;
 
         cache.borrow_mut().cache_account_owned(working_account);

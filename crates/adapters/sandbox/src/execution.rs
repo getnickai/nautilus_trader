@@ -758,7 +758,9 @@ impl ExecutionClient for SandboxExecutionClient {
             return Ok(());
         }
 
-        let balances = self.get_account_balances();
+        // Use current cache balances if already hydrated from Redis (re-registration after eviction).
+        // Falls back to starting_balances for first registration.
+        let balances = self.get_current_account_balances();
         let ts_event = self.clock.borrow().timestamp_ns();
         self.generate_account_state(balances, vec![], false, ts_event)?;
 

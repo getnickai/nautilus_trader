@@ -32,7 +32,6 @@ use nautilus_common::{
     },
     msgbus,
     msgbus::{MessagingSwitchboard, TypedIntoHandler, get_message_bus},
-    runner::try_get_trading_cmd_sender,
     throttler::{RateLimit, Throttler},
 };
 use nautilus_core::{UUID4, WeakCell};
@@ -143,22 +142,15 @@ impl RiskEngine {
         );
 
         // Queued endpoint for deferred command execution (re-entrancy safe).
-        // When a strategy calls `submit_order()` from within an event handler
-        // (e.g., `on_order_filled`), the command is routed through this endpoint.
-        // In live mode the `TradingCommandSender` queues the command for the next
-        // event-loop iteration, preventing a synchronous `deny_order()` from
-        // dispatching an `OrderDenied` back into a strategy that still holds a
-        // mutable borrow — which would otherwise panic on `RefCell` re-entrancy.
-        // In backtest/test mode (no sender), falls back to the direct endpoint.
+        // Always routes to risk_engine_execute so the risk check is never bypassed.
+        // The AsyncTradingCommandSender queues to exec_cmd_tx which the runner
+        // routes to exec_engine_execute — skipping risk. We avoid that by
+        // dispatching directly to risk_engine_execute in all modes.
         msgbus::register_trading_command_endpoint(
             MessagingSwitchboard::risk_engine_queue_execute(),
             TypedIntoHandler::from(move |cmd: TradingCommand| {
-                if let Some(sender) = try_get_trading_cmd_sender() {
-                    sender.execute(cmd);
-                } else {
-                    let endpoint = MessagingSwitchboard::risk_engine_execute();
-                    msgbus::send_trading_command(endpoint, cmd);
-                }
+                let endpoint = MessagingSwitchboard::risk_engine_execute();
+                msgbus::send_trading_command(endpoint, cmd);
             }),
         );
     }

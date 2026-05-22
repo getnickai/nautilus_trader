@@ -38,7 +38,7 @@ use std::{
 use ahash::AHashMap;
 use indexmap::IndexMap;
 use nautilus_core::correctness::{CorrectnessResultExt, FAILED, check_positive_decimal};
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -47,7 +47,7 @@ use crate::{
         base::BaseAccount,
         margin_model::{MarginModel, MarginModelAny},
     },
-    enums::{AccountType, InstrumentClass, LiquiditySide, OrderSide},
+    enums::{AccountType, InstrumentClass, LiquiditySide, OrderSide, PositionSide},
     events::{AccountState, OrderFilled},
     identifiers::{AccountId, InstrumentId},
     instruments::{Instrument, InstrumentAny},
@@ -424,6 +424,72 @@ impl MarginAccount {
             leverage,
             use_quote_for_inverse,
         )
+    }
+
+    /// Estimates the liquidation price for a position under isolated margin.
+    ///
+    /// Uses the actual maintenance margin stored in the account for this position:
+    ///   liq_price = entry × (1 ∓ maint_margin / notional)
+    /// Liquidation occurs when unrealized loss equals the maintenance margin.
+    ///
+    /// Returns `None` for spot instruments, flat positions, or when no maintenance
+    /// margin is recorded for this position.
+    pub fn liquidation_price(
+        &self,
+        instrument: &InstrumentAny,
+        position: &Position,
+    ) -> Option<Price> {
+        if position.side == PositionSide::Flat {
+            return None;
+        }
+
+        // Only linear perps (CryptoPerpetual)
+        match instrument {
+            InstrumentAny::CryptoPerpetual(_) => {}
+            _ => return None,
+        }
+
+        let avg_entry = position.avg_px_open;
+        if avg_entry <= 0.0 {
+            return None;
+        }
+
+        let price_precision = instrument.price_precision();
+
+        // Use the actual maintenance margin stored in the account for this position.
+        let maint_balance = match self.maintenance_margins().get(&instrument.id()).copied() {
+            Some(m) if m.as_decimal() > Decimal::ZERO => m,
+            _ => return None,
+        };
+
+        let notional_value = instrument.calculate_notional_value(
+            position.quantity,
+            Price::new(avg_entry, price_precision),
+            None,
+        );
+        let notional_decimal = notional_value.as_decimal();
+        if notional_decimal.is_zero() {
+            return None;
+        }
+
+        let maint_ratio = maint_balance.as_decimal() / notional_decimal;
+        let maint_ratio_f64 = maint_ratio.to_f64()?;
+
+        if maint_ratio_f64 <= 0.0 || maint_ratio_f64 >= 1.0 {
+            return None;
+        }
+
+        let liq = match position.side {
+            PositionSide::Long => avg_entry * (1.0 - maint_ratio_f64),
+            PositionSide::Short => avg_entry * (1.0 + maint_ratio_f64),
+            _ => return None,
+        };
+
+        if liq <= 0.0 {
+            return None;
+        }
+
+        Some(Price::new(liq, price_precision))
     }
 
     /// Recalculates the account balance for the specified currency based on current margins.

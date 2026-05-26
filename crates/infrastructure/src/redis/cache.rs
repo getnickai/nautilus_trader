@@ -801,6 +801,14 @@ fn insert(pipe: &mut Pipeline, collection: &str, key: &str, value: &[Bytes]) -> 
             insert_string(pipe, key, value[0].as_ref());
             Ok(())
         }
+        // Cache::snapshot_position writes keys like "cache://position-snapshots/…".
+        // get_collection_key splits on ':' yielding collection="cache". Store as a
+        // plain string so the write completes without error. These blobs are
+        // in-session only; cross-session recovery uses order/fill/account events.
+        "cache" => {
+            insert_string(pipe, key, value[0].as_ref());
+            Ok(())
+        }
         _ => anyhow::bail!("Unsupported operation: `insert` for collection '{collection}'"),
     }
 }

@@ -38,7 +38,7 @@ use std::{
 use ahash::AHashMap;
 use indexmap::IndexMap;
 use nautilus_core::correctness::{CorrectnessResultExt, FAILED, check_positive_decimal};
-use rust_decimal::{Decimal, prelude::ToPrimitive};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -426,14 +426,19 @@ impl MarginAccount {
         )
     }
 
-    /// Estimates the liquidation price for a position under isolated margin.
+    /// Estimates the liquidation price for an isolated-margin perpetual position.
     ///
-    /// Uses the actual maintenance margin stored in the account for this position:
-    ///   liq_price = entry × (1 ∓ maint_margin / notional)
-    /// Liquidation occurs when unrealized loss equals the maintenance margin.
+    /// Uses the standard isolated-margin formula:
+    ///   long:  liq_price = avg_entry - (init_margin - maint_margin) / quantity
+    ///   short: liq_price = avg_entry + (init_margin - maint_margin) / quantity
     ///
-    /// Returns `None` for spot instruments, flat positions, or when no maintenance
-    /// margin is recorded for this position.
+    /// Liquidation occurs when the unrealized loss consumes the margin buffer
+    /// (initial_margin - maintenance_margin).  The notional-ratio formula
+    /// `entry × (1 ∓ maint/notional)` ignores leverage and gives a result that
+    /// is much closer to entry than the true liq price.
+    ///
+    /// Returns `None` for spot instruments, flat positions, or when the required
+    /// margin data is not yet recorded in the account.
     pub fn liquidation_price(
         &self,
         instrument: &InstrumentAny,
@@ -454,34 +459,50 @@ impl MarginAccount {
             return None;
         }
 
-        let price_precision = instrument.price_precision();
+        let instrument_id = instrument.id();
 
-        // Use the actual maintenance margin stored in the account for this position.
-        let maint_balance = match self.maintenance_margins().get(&instrument.id()).copied() {
-            Some(m) if m.as_decimal() > Decimal::ZERO => m,
+        let maint_margin = match self.maintenance_margins().get(&instrument_id).copied() {
+            Some(m) if m.as_decimal() > Decimal::ZERO => m.as_f64(),
             _ => return None,
         };
 
-        let notional_value = instrument.calculate_notional_value(
-            position.quantity,
-            Price::new(avg_entry, price_precision),
-            None,
-        );
-        let notional_decimal = notional_value.as_decimal();
-        if notional_decimal.is_zero() {
+        let qty = position.quantity.as_f64();
+        if qty <= 0.0 {
             return None;
         }
 
-        let maint_ratio = maint_balance.as_decimal() / notional_decimal;
-        let maint_ratio_f64 = maint_ratio.to_f64()?;
+        // Compute initial margin dynamically from the position's avg entry price.
+        // We cannot rely on initial_margins() (stored) because it is zeroed to 0
+        // by update_orders_in_place after a market order fills (no open orders remain).
+        let entry_price = instrument.make_price(avg_entry);
+        let init_margin = self
+            .clone()
+            .calculate_initial_margin(instrument, position.quantity, entry_price, None)
+            .map(|m| m.as_f64())
+            .unwrap_or(0.0);
 
-        if maint_ratio_f64 <= 0.0 || maint_ratio_f64 >= 1.0 {
+        let margin_buffer = init_margin - maint_margin;
+
+        // Standard formula: liq = entry ∓ (init_margin - maint_margin) / qty.
+        // Fallback when buffer is near-zero (sandbox: same rate for init and maint):
+        // use entry × (maint / notional) as a proxy for liq distance.
+        let price_delta = if margin_buffer > 1e-8 {
+            margin_buffer / qty
+        } else {
+            let notional = qty * avg_entry;
+            if notional <= 0.0 {
+                return None;
+            }
+            (maint_margin / notional) * avg_entry
+        };
+
+        if price_delta <= 0.0 {
             return None;
         }
 
         let liq = match position.side {
-            PositionSide::Long => avg_entry * (1.0 - maint_ratio_f64),
-            PositionSide::Short => avg_entry * (1.0 + maint_ratio_f64),
+            PositionSide::Long => avg_entry - price_delta,
+            PositionSide::Short => avg_entry + price_delta,
             _ => return None,
         };
 
@@ -489,7 +510,7 @@ impl MarginAccount {
             return None;
         }
 
-        Some(Price::new(liq, price_precision))
+        Some(instrument.make_price(liq))
     }
 
     /// Recalculates the account balance for the specified currency based on current margins.

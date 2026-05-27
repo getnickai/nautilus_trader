@@ -1707,6 +1707,9 @@ impl Cache {
             .entry(mark_price.instrument_id)
             .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
         mark_prices_deque.push_front(mark_price);
+        if mark_prices_deque.len() > self.config.tick_capacity {
+            mark_prices_deque.pop_back();
+        }
         Ok(())
     }
 
@@ -1730,6 +1733,9 @@ impl Cache {
             .entry(index_price.instrument_id)
             .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
         index_prices_deque.push_front(index_price);
+        if index_prices_deque.len() > self.config.tick_capacity {
+            index_prices_deque.pop_back();
+        }
         Ok(())
     }
 
@@ -1753,6 +1759,9 @@ impl Cache {
             .entry(funding_rate.instrument_id)
             .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
         funding_rates_deque.push_front(funding_rate);
+        if funding_rates_deque.len() > self.config.tick_capacity {
+            funding_rates_deque.pop_back();
+        }
         Ok(())
     }
 
@@ -1786,6 +1795,9 @@ impl Cache {
         for funding_rate in funding_rates {
             funding_rate_deque.push_front(*funding_rate);
         }
+        if funding_rate_deque.len() > self.config.tick_capacity {
+            funding_rate_deque.truncate(self.config.tick_capacity);
+        }
         Ok(())
     }
 
@@ -1806,6 +1818,9 @@ impl Cache {
             .entry(status.instrument_id)
             .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
         statuses_deque.push_front(status);
+        if statuses_deque.len() > self.config.tick_capacity {
+            statuses_deque.pop_back();
+        }
         Ok(())
     }
 
@@ -1828,6 +1843,9 @@ impl Cache {
             .entry(quote.instrument_id)
             .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
         quotes_deque.push_front(quote);
+        if quotes_deque.len() > self.config.tick_capacity {
+            quotes_deque.pop_back();
+        }
         Ok(())
     }
 
@@ -1858,6 +1876,9 @@ impl Cache {
         for quote in quotes {
             quotes_deque.push_front(*quote);
         }
+        if quotes_deque.len() > self.config.tick_capacity {
+            quotes_deque.truncate(self.config.tick_capacity);
+        }
         Ok(())
     }
 
@@ -1880,6 +1901,9 @@ impl Cache {
             .entry(trade.instrument_id)
             .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
         trades_deque.push_front(trade);
+        if trades_deque.len() > self.config.tick_capacity {
+            trades_deque.pop_back();
+        }
         Ok(())
     }
 
@@ -1910,6 +1934,9 @@ impl Cache {
         for trade in trades {
             trades_deque.push_front(*trade);
         }
+        if trades_deque.len() > self.config.tick_capacity {
+            trades_deque.truncate(self.config.tick_capacity);
+        }
         Ok(())
     }
 
@@ -1932,6 +1959,9 @@ impl Cache {
             .entry(bar.bar_type)
             .or_insert_with(|| VecDeque::with_capacity(self.config.bar_capacity));
         bars.push_front(bar);
+        if bars.len() > self.config.bar_capacity {
+            bars.pop_back();
+        }
         Ok(())
     }
 
@@ -1957,10 +1987,13 @@ impl Cache {
         let bars_deque = self
             .bars
             .entry(bar_type)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
+            .or_insert_with(|| VecDeque::with_capacity(self.config.bar_capacity));
 
         for bar in bars {
             bars_deque.push_front(*bar);
+        }
+        if bars_deque.len() > self.config.bar_capacity {
+            bars_deque.truncate(self.config.bar_capacity);
         }
         Ok(())
     }
